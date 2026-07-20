@@ -31,6 +31,7 @@ services:
     environment:
       - REDIS_HOST=redis-db
       - WAREHOUSE_YAML=${WAREHOUSE_YAML}
+      - IGNORE_DYNAMIC_OBSTACLES=true
     depends_on:
       - world-sim # To reset db if needed
       - order-processor # To set up tasks etc.
@@ -70,7 +71,7 @@ services:
     depends_on:
       - redis-db # Submit order requests
       - order-processor
-    command: python -m inventory_management_system.fake_order_sender -k 10 --max-item-id ${MAX_ITEM_ID} -d 1
+    command: python -m inventory_management_system.fake_order_sender -k 60 --max-item-id ${MAX_ITEM_ID} -d 0.5
     logging:
       options:
         max-size: 10m

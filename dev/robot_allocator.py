@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 import os
 import time
 import redis
+import numpy as np
 from inventory_management_system.Item import ItemId
 from inventory_management_system.TaskKeyParser import parse_task_key_to_ids
 from job import Job, JobId, JobState
@@ -30,6 +31,11 @@ from warehouses.warehouse_loader import WorldInfo
 
 # Max number of steps to search with A*, should be ~worst case distance in grid
 MAX_PATH_STEPS = int(os.getenv("MAX_PATH_STEPS", default="500"))
+# If a robot cannot advance for long enough, first try a normal replan and then a short
+# escape move that makes room before the job target is tried again.
+STUCK_REPLAN_THRESHOLD = int(os.getenv("STUCK_REPLAN_THRESHOLD", default="5"))
+STUCK_ESCAPE_THRESHOLD = int(os.getenv("STUCK_ESCAPE_THRESHOLD", default="10"))
+STUCK_ESCAPE_MAX_TIME = int(os.getenv("STUCK_ESCAPE_MAX_TIME", default="4"))
 # How much time robot allocator should leave before end of its update and world sim next step
 SAFETY_FACTOR_SEC = float(
     os.getenv("SAFETY_FACTOR_SEC", default="0.200"))
@@ -121,7 +127,8 @@ class RobotAllocator:
             self.logger.warning(
                 f'{robot.robot_id} starting outside of home, assigning taskless job home {job}')
             self.jobs[job.job_id] = job
-            self.allocations[robot.robot_id] = job.job_id
+        self.last_robot_positions: dict[RobotId, Position] = {robot.robot_id: robot.pos for robot in self.robots}
+        self.robot_stuck_counts: dict[RobotId, int] = {robot.robot_id: 0 for robot in self.robots}
         self.wdb.update_robots(self.robots)  # Update new robot state
 
         # Move all in progress tasks back to head of new
@@ -364,6 +371,83 @@ class RobotAllocator:
 
         # Get the dynamic obstacles for this timestep
         self.latest_dynamic_obstacles = self.get_all_current_dynamic_obstacles()
+
+        # Check stuck count and recover robots that have been blocked for too long.
+        for robot in self.robots:
+            r_id = robot.robot_id
+            if robot.state == RobotStatus.IN_PROGRESS and robot.future_path:
+                prev_pos = self.last_robot_positions.get(r_id, robot.pos)
+                if robot.pos == prev_pos:
+                    self.robot_stuck_counts[r_id] = self.robot_stuck_counts.get(r_id, 0) + 1
+                else:
+                    self.robot_stuck_counts[r_id] = 0
+                self.last_robot_positions[r_id] = robot.pos
+
+                stuck_steps = self.robot_stuck_counts.get(r_id, 0)
+
+                # If stuck for long enough, first try a short move that makes room.
+                if stuck_steps >= STUCK_ESCAPE_THRESHOLD:
+                    job_id = self.allocations.get(r_id)
+                    if job_id is not None and job_id in self.jobs:
+                        job = self.jobs[job_id]
+                        static_obstacles = self.get_current_static_obstacles()
+                        target_pos = None
+                        if job.state == JobState.PICKING_ITEM:
+                            target_pos = job.item_zone
+                        elif job.state == JobState.GOING_TO_STATION:
+                            target_pos = job.station_zone
+                        elif job.state == JobState.RETURNING_HOME:
+                            target_pos = job.robot_home
+
+                        if target_pos is not None:
+                            escape_path = self._generate_stuck_escape_path(
+                                robot.pos, target_pos, self.latest_dynamic_obstacles, static_obstacles)
+                            if escape_path:
+                                self.logger.info(
+                                    f"Stuck {stuck_steps} steps: moving Robot {r_id} away from {target_pos} via {escape_path[-1]}")
+                                self.set_robot_path(robot, escape_path)
+                                if job.state == JobState.PICKING_ITEM:
+                                    job.path_robot_to_item = escape_path
+                                elif job.state == JobState.GOING_TO_STATION:
+                                    job.path_item_to_station = escape_path
+                                elif job.state == JobState.RETURNING_HOME:
+                                    job.path_station_to_home = escape_path
+                                robot_was_modified[r_id] = True
+                                self.robot_stuck_counts[r_id] = 0
+                                continue
+
+                # If still stuck after a few steps, replan toward the intended target.
+                if stuck_steps >= STUCK_REPLAN_THRESHOLD:
+                    job_id = self.allocations.get(r_id)
+                    if job_id is not None and job_id in self.jobs:
+                        job = self.jobs[job_id]
+                        static_obstacles = self.get_current_static_obstacles()
+                        target_pos = None
+                        if job.state == JobState.PICKING_ITEM:
+                            target_pos = job.item_zone
+                        elif job.state == JobState.GOING_TO_STATION:
+                            target_pos = job.station_zone
+                        elif job.state == JobState.RETURNING_HOME:
+                            target_pos = job.robot_home
+
+                        if target_pos is not None:
+                            new_path = self.generate_path(
+                                robot.pos, target_pos, self.latest_dynamic_obstacles, static_obstacles)
+                            if new_path:
+                                self.logger.info(
+                                    f"Stuck {stuck_steps} steps: Replanned path for Robot {r_id} ({robot.pos} -> {target_pos})")
+                                self.set_robot_path(robot, new_path)
+                                if job.state == JobState.PICKING_ITEM:
+                                    job.path_robot_to_item = new_path
+                                elif job.state == JobState.GOING_TO_STATION:
+                                    job.path_item_to_station = new_path
+                                elif job.state == JobState.RETURNING_HOME:
+                                    job.path_station_to_home = new_path
+                                robot_was_modified[r_id] = True
+                                self.robot_stuck_counts[r_id] = 0
+            else:
+                self.robot_stuck_counts[r_id] = 0
+                self.last_robot_positions[r_id] = robot.pos
         # Only process jobs for up to time_allotted_for_jobs locally and time_left total
         jobs_processed = 0
         processed_jobs: list[Job] = []
@@ -479,7 +563,15 @@ class RobotAllocator:
 
     def generate_path(self, pos_a: Position, pos_b: Position,
                       dynamic_obstacles, static_obstacles) -> Path:
-        """Generate a path from a to b avoiding existing robots"""
+        """Generate a path from a to b.
+
+        When IGNORE_DYNAMIC_OBSTACLES=true (default), uses plain wall-only A* so
+        robots plan the shortest path with zero awareness of other robots. This causes
+        head-on deadlocks and gridlocks for dataset generation.
+
+        When IGNORE_DYNAMIC_OBSTACLES=false, uses cooperative Space-Time A* to avoid
+        other robots (normal production behaviour).
+        """
         t_start = time.perf_counter()
         stats = {
             'pos_a': pos_a,
@@ -491,15 +583,92 @@ class RobotAllocator:
         true_dists = self.heuristic_dict[pos_b]
 
         def true_heuristic(pos_a: Position) -> float:
-            """Returns A* shortest path between any two points based on world_grid"""
+            """Returns pre-computed shortest path distance heuristic."""
             return true_dists[pos_a]
-        path = pf.st_astar(
-            self.world_grid, pos_a, pos_b, dynamic_obstacles, static_obstacles=static_obstacles,
-            end_fast=True, max_time=self.max_steps, heuristic=true_heuristic, stats=stats,
-            validate_ends=False)
+
+        # When naive mode is on, use plain A* (walls only).
+        # Robots will plan straight-through paths with no robot awareness,
+        # resulting in realistic head-on conflicts and deadlocks.
+        naive_mode = os.getenv("IGNORE_DYNAMIC_OBSTACLES", "true").lower() == "true"
+
+        if naive_mode:
+            # Plain A* — only avoids physical walls, completely ignores all robots
+            path = pf.astar(
+                self.world_grid, pos_a, pos_b,
+                max_steps=self.max_steps,
+                heuristic=true_heuristic)
+        else:
+            # Cooperative Space-Time A* — avoids both static and dynamic robot obstacles
+            path = pf.st_astar(
+                self.world_grid, pos_a, pos_b, dynamic_obstacles,
+                static_obstacles=static_obstacles,
+                end_fast=True, max_time=self.max_steps, heuristic=true_heuristic, stats=stats,
+                validate_ends=False)
+
         self.logger.info(
-            f'generate_path took {(time.perf_counter() - t_start)*1000:.3f} ms - {stats}')
+            f'generate_path (naive={naive_mode}) took {(time.perf_counter() - t_start)*1000:.3f} ms'
+            f' - {stats}')
         return path
+
+    def _generate_stuck_escape_path(self, pos_a: Position, pos_b: Position,
+                                    dynamic_obstacles, static_obstacles) -> Path:
+        """Generate a short path that moves a robot away from a deadlock.
+
+        This keeps the robot active instead of repeatedly requesting the same blocked target.
+        """
+        max_row, max_col = self.world_grid.shape
+
+        def in_bounds(pos: Position) -> bool:
+            return 0 <= pos[0] < max_row and 0 <= pos[1] < max_col
+
+        def manhattan(pos: Position) -> int:
+            return abs(pos[0] - pos_b[0]) + abs(pos[1] - pos_b[1])
+
+        frontier: list[tuple[Position, int]] = [(pos_a, 0)]
+        seen = {pos_a}
+        candidates: list[tuple[int, int, Position]] = []
+        idx = 0
+        while idx < len(frontier):
+            current_pos, depth = frontier[idx]
+            idx += 1
+            if depth >= 3:
+                continue
+
+            row, col = current_pos
+            neighbors = [
+                (row - 1, col),
+                (row + 1, col),
+                (row, col - 1),
+                (row, col + 1),
+            ]
+            for neighbor in neighbors:
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                if not in_bounds(neighbor):
+                    continue
+                if self.world_grid[neighbor[0], neighbor[1]] > 0:
+                    continue
+                if neighbor in static_obstacles:
+                    continue
+                frontier.append((neighbor, depth + 1))
+                if neighbor != pos_a:
+                    candidates.append((manhattan(neighbor), depth + 1, neighbor))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        for _, _, escape_goal in candidates:
+            def escape_heuristic(pos: Position, goal: Position = escape_goal) -> float:
+                return abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+
+            escape_path = pf.st_astar(
+                self.world_grid, pos_a, escape_goal, dynamic_obstacles,
+                static_obstacles=static_obstacles,
+                end_fast=True, max_time=STUCK_ESCAPE_MAX_TIME,
+                heuristic=escape_heuristic)
+            if escape_path:
+                return escape_path
+
+        return []
 
     def set_robot_path(self, robot: Robot, path: Path):
         """Sets robot path, and also updates latest dynamic obstacles with this"""

@@ -269,6 +269,22 @@ def find_given_collisions(paths: list[list[Position]], selected_idxs: list[int])
     return collisions
 
 
+def _stagger_paths(paths: list[Path], collision_budget: int) -> list[Path]:
+    if collision_budget <= 0:
+        return paths
+
+    staggered_paths: list[Path] = []
+    for path_idx, path in enumerate(paths):
+        if not path:
+            staggered_paths.append(path)
+            continue
+
+        delay = path_idx % (collision_budget + 1)
+        staggered_paths.append([path[0]] * delay + path)
+
+    return staggered_paths
+
+
 def find_collisions(path1: list[Position],
                     path2: list[Position], label: int = 1) -> list[Collision]:
     # Find any vertex and edge collisions, and return a list of (path_idx,row,col,t) collisions
@@ -304,7 +320,7 @@ def find_collisions(path1: list[Position],
     return collisions
 
 
-def mapf0(grid, starts, goals):
+def mapf0(grid, starts, goals, collision_budget: int = 0):
     # For several robots with given start/goal locations and a grid
     # Get paths for all, do all as independent
     #  - independent A-star for each as initial paths
@@ -312,10 +328,10 @@ def mapf0(grid, starts, goals):
     paths = []
     for i, start in enumerate(starts):
         paths.append(astar(grid, start, goals[i]))
-    return paths
+    return _stagger_paths(paths, collision_budget)
 
 
-def mapf1(grid, starts, goals, maxiter=5, max_time=20):
+def mapf1(grid, starts, goals, maxiter=5, max_time=20, collision_budget: int = 0):
     # For several robots with given start/goal locations and a grid
     # Attempt to find paths for all that don't collide
     # Attempt 1:
@@ -337,6 +353,9 @@ def mapf1(grid, starts, goals, maxiter=5, max_time=20):
     if not collisions:
         return paths
 
+    if len(collisions) <= collision_budget:
+        return paths
+
     # list of (path_idx, row, col, t)
     for i in range(maxiter):
         # print(f'{i} | Trying to remove collisions: {collisions}')
@@ -352,7 +371,7 @@ def mapf1(grid, starts, goals, maxiter=5, max_time=20):
         # print('After:')
         # print(paths[path_idx])
         collisions = find_all_collisions(paths)
-        if not collisions:
+        if not collisions or len(collisions) <= collision_budget:
             break
 
         # Note: Keeps old dynamic obstacles, not optimal
@@ -362,7 +381,7 @@ def mapf1(grid, starts, goals, maxiter=5, max_time=20):
     print(f'Iterated {i} times')
     return paths
 
-def mapf2(grid, starts, goals, maxiter=5, max_time=20):
+def mapf2(grid, starts, goals, maxiter=5, max_time=20, collision_budget: int = 0):
     # For several robots with given start/goal locations and a grid
     # Attempt 2:
     #  - independent A-star for each as initial paths
@@ -384,6 +403,9 @@ def mapf2(grid, starts, goals, maxiter=5, max_time=20):
     # print(f'Initial paths have {len(path_collisions.keys())} / {len(paths)} colliding paths: {path_collisions.keys()}')
 
     if not collisions:
+        return paths
+
+    if len(collisions) <= collision_budget:
         return paths
 
 
@@ -426,7 +448,7 @@ def mapf2(grid, starts, goals, maxiter=5, max_time=20):
         # print(f'[I={i}] - After updating path for {path_idx} we have {len(path_collisions.keys())} / {len(paths)} colliding paths: {path_collisions.keys()}')
         # print(path_collisions)
         # print('--')
-        if not collisions:
+        if not collisions or len(collisions) <= collision_budget:
             break
 
     print(f'Iterated {i} times')

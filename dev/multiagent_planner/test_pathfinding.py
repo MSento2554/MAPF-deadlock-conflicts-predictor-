@@ -33,6 +33,24 @@ class TestPathfinding(unittest.TestCase):
         collisions = pathfinding.find_all_collisions(paths)
         self.assertEqual(collisions, [])
 
+    def test_mapf_collision_budget_keeps_collisions(self):
+        grid, goals, starts = get_scenario(
+            'multiagent_planner/scenarios/scenario3.yaml')
+
+        baseline_paths = pathfinding.mapf0(grid, starts, goals)
+        baseline_collisions = pathfinding.find_all_collisions(baseline_paths)
+        self.assertGreater(len(baseline_collisions), 0)
+
+        mapf1_paths = pathfinding.mapf1(
+            grid, starts, goals, maxiter=100, collision_budget=len(baseline_collisions))
+        self.assertEqual(
+            pathfinding.find_all_collisions(mapf1_paths), baseline_collisions)
+
+        mapf2_paths = pathfinding.mapf2(
+            grid, starts, goals, maxiter=100, collision_budget=len(baseline_collisions))
+        self.assertEqual(
+            pathfinding.find_all_collisions(mapf2_paths), baseline_collisions)
+
     def test_single_robot_astar(self):
         grid, goals, starts = get_scenario(
             'multiagent_planner/scenarios/scenario1.yaml')

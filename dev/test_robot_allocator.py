@@ -260,6 +260,24 @@ class TestRobotAllocator(unittest.TestCase):
             self.assertIsNone(robot_mgr.allocations[robot.robot_id])
             self.assertEqual(len(robot_mgr.jobs), 0)
 
+    def test_stuck_escape_path_moves_away_from_target(self):
+        mock_redis.smembers.return_value = set()
+        mock_redis.xread.return_value = None
+        mock_wdb.get_robots.return_value = []
+        robot_mgr = RobotAllocator(
+            logger, mock_redis, mock_wdb, default_world, mock_heuristic)
+
+        start_pos = Position((2, 2))
+        target_pos = Position((2, 4))
+        escape_path = robot_mgr._generate_stuck_escape_path(
+            start_pos, target_pos, set(), set())
+
+        self.assertTrue(escape_path)
+        self.assertNotEqual(escape_path[-1], start_pos)
+        start_distance = abs(start_pos[0] - target_pos[0]) + abs(start_pos[1] - target_pos[1])
+        end_distance = abs(escape_path[-1][0] - target_pos[0]) + abs(escape_path[-1][1] - target_pos[1])
+        self.assertGreater(end_distance, start_distance)
+
     def test_allocate_revert_too_long(self):
         """Expect assigns a task to robot, too-long update reverts change"""
 

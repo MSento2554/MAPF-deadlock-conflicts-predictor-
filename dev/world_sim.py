@@ -188,14 +188,44 @@ class World(object):
         return self.collisions == []
 
     def step_robots(self) -> list[bool]:
-        """Step robots, and return a bool list of those robots that changed positions."""
+        """Step robots, and return a bool list of those robots that changed positions.
+
+        Uses chain-resolution (while loop) so convoy-blocked robots can unblock sequentially.
+        A 20% random delay per robot per attempt breaks cooperative schedules, creating
+        realistic congestion, waiting, and head-on conflicts without permanent gridlock.
+        """
         self.past_robot_positions.clear()
         for robot in self.robots:
             self.past_robot_positions[robot.pos] = robot.robot_id
 
+        import random
         state_changed = [False] * len(self.robots)
-        for idx, robot in enumerate(self.robots):
-            state_changed[idx] = robot.move_to_next_position()
+        occupied_positions = {robot.pos for robot in self.robots}
+
+        # Chain-resolution: keep iterating until no more robots can move this step.
+        # Shuffle order each iteration to avoid systematic bias.
+        moved_any = True
+        while moved_any:
+            moved_any = False
+            indices = list(range(len(self.robots)))
+            random.shuffle(indices)
+            for idx in indices:
+                if state_changed[idx]:
+                    continue
+                robot = self.robots[idx]
+                next_pos = robot.peek_next_pos()
+                if next_pos is not None:
+                    # 20% chance of random mechanical delay — creates realistic congestion
+                    if random.random() < 0.20:
+                        continue
+                    # A wait action (next_pos == robot.pos) is always valid since it is the current position
+                    if next_pos == robot.pos or next_pos not in occupied_positions:
+                        occupied_positions.discard(robot.pos)
+                        robot.move_to_next_position()
+                        occupied_positions.add(robot.pos)
+                        state_changed[idx] = True
+                        moved_any = True
+
         return state_changed
 
     @timeit
