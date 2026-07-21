@@ -42,19 +42,10 @@ def engineer_spatial_features(df):
     df["x_norm"] = (df["x"] - x_min) / (x_max - x_min) if x_max != x_min else 0
     df["y_norm"] = (df["y"] - y_min) / (y_max - y_min) if y_max != y_min else 0
 
-    print("\n[3b] Calculating vertex risk factors...")
-    vertex_mentions = df['collision_vertex'].value_counts()
-    
-    # Number of times a collision/stuck state actually occurred on that vertex
-    # (Assuming a collision is recorded when the robot is currently stuck/deadlocked)
-    vertex_collisions = df[df['is_conflict'] == True]['collision_vertex'].value_counts()
-    
-    # Calculate risk factor: (collisions / mentions) and fill unproblematic vertices with 0
-    risk_factor_map = (vertex_collisions / vertex_mentions).fillna(0)
-    
-    # Map back to the dataframe (automatically normalizes between 0.0 and 1.0 based on ratio)
-    df['vertex_risk_factor'] = df['collision_vertex'].map(risk_factor_map)
-    
+    # NOTE: vertex_risk_factor is intentionally NOT computed here.
+    # It must be derived only from the training partition (after the train/test split)
+    # to avoid target leakage. It is computed in the evaluation script instead.
+
     return df
 
 def create_rolling_features(df, window_size=5):
@@ -81,23 +72,181 @@ def create_rolling_features(df, window_size=5):
     
     return df
 
-def preprocess_congestion_dataset(df, lead_time_steps=5, window_size=5):
+def normalize_density_features(df, window_size=5):
+    """
+    Adds scale-invariant density features normalised per robot's recent history.
+    These transfer better across scenarios with different baseline density levels,
+    directly addressing the cross-dataset generalisation problem.
 
-    print("\n[1/4] Creating predictive conflict labels...")
+    Features added:
+      - density_3_zscore : (d3 - rolling_mean) / (rolling_std + 0.1)
+                           Relative congestion vs this robot's recent baseline.
+      - density_5_zscore : same for wider radius
+      - density_3_peak   : rolling max over window — captures spike events
+                           that the rolling mean smooths away.
+      - density_5_peak   : same for wider radius
+      - density_3_accel  : second difference — how fast is congestion
+                           accelerating? Detects build-up earlier than delta.
+      - density_5_accel  : same for wider radius
+    """
+    print("\n[5a] Computing per-robot density z-scores (scale-invariant)...")
+    df = df.sort_values(by=["robot_id", "t"]).reset_index(drop=True)
+
+    for col, prefix in [
+        ("local_density_3", "density_3"),
+        ("local_density_5", "density_5"),
+    ]:
+        grp = df.groupby("robot_id")[col]
+
+        roll_mean = grp.transform(
+            lambda x: x.rolling(window=window_size, min_periods=1).mean()
+        )
+        roll_std = grp.transform(
+            lambda x: x.rolling(window=window_size, min_periods=1).std().fillna(0)
+        )
+
+        # Z-score: how many std-devs above/below this robot's recent average?
+        # Clipped to [-5, 5] to prevent outlier explosion.
+        df[f"{prefix}_zscore"] = (
+            (df[col] - roll_mean) / (roll_std + 0.1)
+        ).clip(-5, 5)
+
+        # Rolling peak: worst-case density seen in the last window steps
+        df[f"{prefix}_peak"] = grp.transform(
+            lambda x: x.rolling(window=window_size, min_periods=1).max()
+        )
+
+        # Acceleration: second difference — rate of change of the rate of change
+        # Positive = congestion building faster; negative = dispersing faster
+        df[f"{prefix}_accel"] = grp.transform(
+            lambda x: x.diff(window_size).diff(window_size).fillna(0)
+        )
+
+    print("[5b] Done: z-score, peak, acceleration computed for density_3 and density_5.")
+    return df
+
+def create_behavioral_features(df, window_size=5, num_lags=3):
+    """
+    Engineers genuine leading-indicator features that capture robot dynamics
+    BEFORE a deadlock occurs — no current conflict state is encoded.
+
+    Features added:
+      - steps_stationary      : consecutive steps at the same (x,y) grid cell
+                                (robot slowing/stopping before deadlock)
+      - stuck_duration_lag_N  : stuck_duration N steps ago — a mild early
+                                warning signal without encoding current state
+      - density_3_delta       : change in local density over last window_size
+                                steps (is congestion building up?)
+      - density_5_delta       : same for the wider radius
+      - density_spread        : density_5 / density_3 ratio — are nearby
+                                robots concentrated (bottleneck) or spread out?
+      - density_3_lag_N       : lagged snapshots of local crowding (N=1..num_lags)
+      - density_5_lag_N       : lagged snapshots of wider crowding
+    """
+    print("\n[6a] Computing position-stationarity (steps at same grid cell)...")
+    df = df.sort_values(by=["robot_id", "t"]).reset_index(drop=True)
+
+    # Position key per row
+    df["_pos_key"] = df["x"].astype(str) + "_" + df["y"].astype(str)
+
+    # 1 if position changed from previous step, 0 if robot stayed in same cell
+    df["_pos_changed"] = (
+        df.groupby("robot_id")["_pos_key"].shift(1) != df["_pos_key"]
+    ).astype(int).fillna(1)
+
+    # Cumsum of changes creates block IDs; cumcount within each block = steps stationary
+    df["_block"] = df.groupby("robot_id")["_pos_changed"].cumsum()
+    df["steps_stationary"] = df.groupby(["robot_id", "_block"]).cumcount()
+
+    # Stationary ratio: bounded [0.0–1.0] fraction of last N steps without moving.
+    # More interpretable than raw cumulative count; doesn't grow unboundedly.
+    df["_not_changed"] = 1 - df["_pos_changed"]
+    df["stationary_ratio"] = df.groupby("robot_id")["_not_changed"].transform(
+        lambda x: x.rolling(window=window_size, min_periods=1).mean()
+    )
+
+    df.drop(columns=["_pos_key", "_pos_changed", "_not_changed", "_block"], inplace=True)
+
+    # Neighbour stationarity count: how many OTHER robots are frozen at the same t?
+    # System-wide signal, completely scale-independent across scenarios.
+    print("\n[6b] Computing neighbour stationarity count (system-wide pressure)...")
+    static_at_t = df.groupby("t")["steps_stationary"].transform(lambda x: (x > 0).sum())
+    df["neighbour_static_count"] = (
+        static_at_t - (df["steps_stationary"] > 0).astype(int)
+    ).clip(lower=0)
+
+    # NOTE: stuck_duration_lag_N was removed — even lagged by 1 step,
+    # stuck_duration encodes near-current stuck state (deadlocks persist
+    # across steps), causing the model to shortcut instead of learning
+    # genuine leading behavioural patterns.
+
+    print("\n[6c] Computing density trend (rate of congestion change)...")
+    # Positive delta = congestion growing; negative = robots dispersing
+    df["density_3_delta"] = (
+        df.groupby("robot_id")["local_density_3"]
+        .transform(lambda x: x.diff(periods=window_size).fillna(0))
+    )
+    df["density_5_delta"] = (
+        df.groupby("robot_id")["local_density_5"]
+        .transform(lambda x: x.diff(periods=window_size).fillna(0))
+    )
+
+    print("\n[6d] Computing density spread (bottleneck vs wide congestion)...")
+
+    # High spread (density_5 >> density_3) = many robots nearby but spread out
+    # Low spread (density_5 ≈ density_3) = tight cluster — deadlock risk
+    df["density_spread"] = (
+        df["local_density_5"] / df["local_density_3"].replace(0, 1)
+    ).clip(upper=10)  # cap outliers from near-zero density_3
+
+    print(f"\n[6e] Creating density lag features (N=1..{num_lags})...")
+
+    for lag in range(1, num_lags + 1):
+        df[f"density_3_lag_{lag}"] = (
+            df.groupby("robot_id")["local_density_3"].shift(lag).fillna(0)
+        )
+        df[f"density_5_lag_{lag}"] = (
+            df.groupby("robot_id")["local_density_5"].shift(lag).fillna(0)
+        )
+
+    return df
+
+def preprocess_congestion_dataset(df, lead_time_steps=5, window_size=5, num_lags=3):
+
+    print("\n[1/6] Creating predictive conflict labels...")
     df = create_predictive_conflict_labels(df, prediction_horizon=lead_time_steps)
 
-    print("\n[2/4] Encoding categorical features...")
+    print("\n[2/6] Encoding categorical features...")
     df = encode_categoricals(df)
 
-    print("\n[3/4] Engineering spatial features...")
+    print("\n[3/6] Engineering spatial features...")
     df = engineer_spatial_features(df)
 
-    print("\n[4/4] Creating rolling features...")
+    print("\n[4/6] Creating rolling/velocity features...")
     df = create_rolling_features(df, window_size=window_size)
 
+    print("\n[5/6] Normalising density features (z-score, peak, acceleration)...")
+    df = normalize_density_features(df, window_size=window_size)
+
+    print("\n[6/6] Engineering behavioral leading-indicator features...")
+    df = create_behavioral_features(df, window_size=window_size, num_lags=num_lags)
+
     columns_to_drop = [
-        'is_conflict', 'is_stuck', 'is_deadlocked', 'stuck_duration', 
-        'x', 'y', 'local_density_3', 'local_density_5'
+        # ── Current conflict state indicators (target components) ──────────
+        # These directly encode the current conflict state and would leak the
+        # answer. stuck_duration_lag_N variants are kept as leading indicators.
+        'is_conflict', 'is_stuck', 'is_deadlocked', 'stuck_duration',
+        'collision_vertex', 'collision_edge',
+        # ── Current-state-only columns ─────────────────────────────────────
+        # path_length is ONLY non-zero when already deadlocked.
+        'path_length',
+        # dx, dy, speed are all-zero in this simulator (robots teleport).
+        'dx', 'dy', 'speed',
+        # ── Raw columns replaced by engineered versions ────────────────────
+        # Raw coordinates → x_norm, y_norm
+        'x', 'y',
+        # Raw density → smoothed + delta + lag variants
+        'local_density_3', 'local_density_5',
     ]
     df = df.drop(columns=columns_to_drop)
     
