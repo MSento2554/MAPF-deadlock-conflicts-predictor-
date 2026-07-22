@@ -1,7 +1,6 @@
 numpy
 PyYAML
 redis[hiredis]
-# ML model evaluation dependencies
 xgboost
 scikit-learn
 pandas
