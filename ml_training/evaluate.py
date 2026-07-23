@@ -81,11 +81,11 @@ def evaluate_single_model(
                 scores = [fold[key] for fold in cv_results]
                 print(f"{key.upper():10s}: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
 
-    # --- Visualization ---
+    # --- Visualizations ---
     color_map = "Blues" if "spatial" in model_name.lower() else "Oranges"
     file_suffix = "spatial" if "spatial" in model_name.lower() else "temporal"
 
-    # 1. Confusion Matrix (Normalized)
+    # 1. Normalized Confusion Matrix
     plt.figure(figsize=(6, 5))
     cm = confusion_matrix(y_test, pred, normalize="true")
     sns.heatmap(
@@ -166,12 +166,12 @@ def evaluate_models():
 
     df = pd.read_csv(DATA_PATH)
 
-    # 1. Clean target & sort chronologically to match training pipeline
+    # 1. Clean target and sort chronologically to match training pipeline
     df = df.dropna(subset=["target_future_conflict"])
     df["target_future_conflict"] = df["target_future_conflict"].astype(int)
     df = df.sort_values(["t", "robot_id"]).reset_index(drop=True)
 
-    # 2. Strict time-based split (80/20)
+    # 2. Strict time-based split (80/20 rule)
     split_tick = df["t"].quantile(0.8)
     test_df = df[df["t"] > split_tick]
 
@@ -185,7 +185,7 @@ def evaluate_models():
     temporal_path = os.path.join(MODEL_DIR, "temporal_model.pkl")
     temporal_metrics = evaluate_single_model("Temporal Model", temporal_path, test_df)
 
-    # 5. Summarize test set performance & Comparison Table
+    # 5. Summarize test performance and generate comparison table
     if spatial_metrics and temporal_metrics:
         summary_df = pd.DataFrame([
             {"Model": "Spatial Model", **spatial_metrics},
@@ -201,6 +201,6 @@ def evaluate_models():
 
 
 if __name__ == "__main__":
-    # 1. Chạy đánh giá các mô hình như bình thường (ví dụ: Confusion Matrix, ROC, v.v.)
+    # Execute standard model evaluation pipeline (Confusion Matrices, ROC, PR curves, etc.)
     evaluate_models()
     

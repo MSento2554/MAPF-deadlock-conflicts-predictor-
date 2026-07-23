@@ -20,26 +20,26 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 
 def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     """
-    Phân tích chuyên sâu hiện tượng 'layout memorization' và xuất kết quả hoàn toàn dưới dạng Text Report.
+    In-depth analysis of spatial layout characteristics and model predictions (Text Report).
     """
     print("\n" + "="*50)
     print("      TEXT REPORT: SPATIAL LAYOUT MEMORIZATION       ")
     print("="*50)
     
     if not os.path.exists(spatial_model_path):
-        print(f"[Lỗi] Không tìm thấy model tại {spatial_model_path}")
+        print(f"[Error] Model not found at {spatial_model_path}")
         return
 
     if not os.path.exists(processed_data_path):
-        print(f"[Lỗi] Không tìm thấy processed dataset tại {processed_data_path}")
+        print(f"[Error] Processed dataset not found at {processed_data_path}")
         return
         
-    # 1. Đọc processed dataset
+    # 1. Load processed dataset
     df_proc = pd.read_csv(processed_data_path)
     df_proc = df_proc.dropna(subset=["target_future_conflict"])
     df_proc["target_future_conflict"] = df_proc["target_future_conflict"].astype(int)
 
-    # Tìm file raw để map tọa độ x, y
+    # Locate raw dataset to map (x, y) coordinates
     possible_paths = [
         os.path.join(os.path.dirname(processed_data_path), "congestion_dataset.csv"),
         os.path.join(os.path.dirname(os.path.dirname(processed_data_path)), "congestion_dataset.csv"),
@@ -60,18 +60,18 @@ def evaluate_layout_memorization(spatial_model_path, processed_data_path):
             if "y" in df_proc.columns: df_proc = df_proc.drop(columns=["y"])
             df_proc = pd.merge(df_proc, df_raw[["robot_id", "t", "x", "y"]], on=["robot_id", "t"], how="left")
     else:
-        print("[Lỗi] Không tìm thấy file congestion_dataset.csv gốc để lấy tọa độ x, y!")
+        print("[Error] Raw dataset 'congestion_dataset.csv' not found for coordinate mapping!")
         return
     
     if "x" not in df_proc.columns or "y" not in df_proc.columns:
-        print("[Lỗi] Không thể gán được cột 'x' và 'y'!")
+        print("[Error] Failed to assign 'x' and 'y' coordinates!")
         return
 
-    # 2. Tạo Ground Truth Map
+    # 2. Build Ground Truth Map
     heat = df_proc.groupby(["y", "x"])["target_future_conflict"].mean().reset_index()
     heatmap_target = heat.pivot(index="y", columns="x", values="target_future_conflict")
 
-    # 3. Tạo Model Prediction Map
+    # 3. Build Model Prediction Map
     package = joblib.load(spatial_model_path)
     model = package["model"]
     features = package["features"]
@@ -83,7 +83,7 @@ def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     pred_heat = df_proc.groupby(["y", "x"])["predicted_prob"].mean().reset_index()
     heatmap_pred = pred_heat.pivot(index="y", columns="x", values="predicted_prob")
 
-    # 4. Căn chỉnh ma trận để so khớp
+    # 4. Align matrices for comparison
     aligned_target, aligned_pred = heatmap_target.align(heatmap_pred, join="inner")
     
     target_stacked = aligned_target.stack()
@@ -94,7 +94,7 @@ def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     p_vals = pred_stacked[valid_idx]
     cell_count = len(t_vals)
 
-    # 5. Tính toán các metric thống kê & Entropy
+    # 5. Compute statistical metrics & Entropy
     def binary_entropy(p):
         p = np.clip(p, 1e-9, 1 - 1e-9)
         return - (p * np.log2(p) + (1 - p) * np.log2(1 - p))
@@ -105,21 +105,21 @@ def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     pearson_corr, _ = pearsonr(t_vals, p_vals)
     spearman_corr, _ = spearmanr(t_vals, p_vals)
 
-    # 6. In kết quả dạng Text hoàn toàn
-    print(f"[1] Tổng số ô kho (Warehouse Cells) được đánh giá : {cell_count}")
-    print(f"[2] Pearson Correlation  (Target vs Prediction)  : {pearson_corr:.4f}")
-    print(f"[3] Spearman Correlation (Target vs Prediction)  : {spearman_corr:.4f}")
-    print(f"[4] Mean Binary Entropy H(target | x,y)          : {mean_entropy:.4f}")
+    # 6. Output text report
+    print(f"[1] Evaluated warehouse cells count       : {cell_count}")
+    print(f"[2] Pearson Correlation (Target vs Pred)  : {pearson_corr:.4f}")
+    print(f"[3] Spearman Correlation (Target vs Pred) : {spearman_corr:.4f}")
+    print(f"[4] Mean Binary Entropy H(target | x,y)   : {mean_entropy:.4f}")
     
-    print("\n--- Đánh giá nhanh tính chất Layout Memorization ---")
+    print("\n--- Layout Memorization Insights ---")
     if mean_entropy < 0.3:
-        print("-> Nhận định: Entropy trung bình rất thấp (gần 0). Điều này chứng minh không gian kho mang tính quyết định (deterministic) cao theo vị trí, giải thích vì sao mô hình Spatial đạt hiệu năng rất tốt chỉ nhờ ghi nhớ layout.")
+        print("-> Insight: Low mean entropy suggests that future conflicts are highly deterministic with respect to spatial location, partially explaining the strong performance of the Spatial Model.")
     else:
-        print("-> Nhận định: Entropy ở mức trung bình/cao, cho thấy sự biến động lớn tại các ô, mô hình cần kết hợp thêm yếu tố thời gian (temporal dynamics).")
+        print("-> Insight: Moderate/High entropy indicates higher variance across cells, implying that temporal dynamics play a more substantial role.")
     print("="*50)
 
 if __name__ == "__main__":
-    # 2. Chạy phân tích chuyên sâu Layout Memorization & Entropy (6 figures)
+    # Execute layout memorization and entropy analysis pipeline
     spatial_path = os.path.join(MODEL_DIR, "spatial_model.pkl")
     
     evaluate_layout_memorization(
