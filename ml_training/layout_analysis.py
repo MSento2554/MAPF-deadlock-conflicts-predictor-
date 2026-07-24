@@ -20,7 +20,8 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 
 def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     """
-    In-depth analysis of spatial layout characteristics and model predictions (Text Report).
+    In-depth analysis of spatial layout characteristics and model predictions,
+    including visual heatmap generation for ground truth and model predictions.
     """
     print("\n" + "="*50)
     print("      TEXT REPORT: SPATIAL LAYOUT MEMORIZATION       ")
@@ -105,11 +106,98 @@ def evaluate_layout_memorization(spatial_model_path, processed_data_path):
     pearson_corr, _ = pearsonr(t_vals, p_vals)
     spearman_corr, _ = spearmanr(t_vals, p_vals)
 
-    # 6. Output text report
+    # 6. Generate and save heatmaps with a unified color scale (vmin=0, vmax=1)
+    vmin, vmax = 0, 1
+
+    # Ground Truth Heatmap
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        heatmap_target,
+        cmap="YlOrRd",
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        cbar_kws={"label": "Future Conflict Probability"},
+        linewidths=0.1,
+    )
+    plt.title("Ground Truth Future Conflict Heatmap")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(FIGURES_DIR, "ground_truth_heatmap.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    # Prediction Heatmap
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        heatmap_pred,
+        cmap="YlOrRd",
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        cbar_kws={"label": "Predicted Conflict Probability"},
+        linewidths=0.1,
+    )
+    plt.title("Spatial Model Prediction Heatmap")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(FIGURES_DIR, "prediction_heatmap.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    # Side-by-Side Comparison Heatmap
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    sns.heatmap(
+        heatmap_target,
+        ax=axes[0],
+        cmap="YlOrRd",
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        cbar=False,
+        linewidths=0.1
+    )
+    axes[0].set_title("Ground Truth")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+
+    sns.heatmap(
+        heatmap_pred,
+        ax=axes[1],
+        cmap="YlOrRd",
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        cbar=True,
+        cbar_kws={"label": "Probability"},
+        linewidths=0.1
+    )
+    axes[1].set_title("Spatial Prediction")
+    axes[1].set_xlabel("x")
+    axes[1].set_ylabel("y")
+
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(FIGURES_DIR, "groundtruth_vs_prediction.png"),
+        dpi=300,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    # 7. Output text report
     print(f"[1] Evaluated warehouse cells count       : {cell_count}")
     print(f"[2] Pearson Correlation (Target vs Pred)  : {pearson_corr:.4f}")
     print(f"[3] Spearman Correlation (Target vs Pred) : {spearman_corr:.4f}")
     print(f"[4] Mean Binary Entropy H(target | x,y)   : {mean_entropy:.4f}")
+    print(f"[5] Saved heatmaps to                     : {FIGURES_DIR}")
     
     print("\n--- Layout Memorization Insights ---")
     if mean_entropy < 0.3:
